@@ -3,12 +3,12 @@ import { trpc } from "@/lib/trpc";
 import SortableStopCard from "@/components/SortableStopCard";
 import EditStopModal from "@/components/EditStopModal";
 import { useVoiceSearch } from "@/hooks/useVoiceSearch";
-import RouteIntelligenceMultiIndex from "@/lib/routeIntelligenceMultiIndex";
+import RouteIntelligenceMultiIndex, { type SearchResult } from "@/lib/routeIntelligenceMultiIndex";
 import RouteIntelligenceDebugger from "@/lib/routeIntelligenceDebugger";
 import { riFeatureFlag } from "@/lib/routeIntelligenceFeatureFlag";
-import { detectCorrection, createVoiceSearchContext, isWithinCorrectionWindow, type VoiceSearchContext } from "@/lib/correctionDetection";
+import { detectCorrection, createVoiceSearchContext, isWithinCorrectionWindow, normalizeTranscript, type VoiceSearchContext } from "@/lib/correctionDetection";
 import { recordSearchEvent, type SearchEvent } from "@/lib/fieldTestingLogger";
-import { Mic, MicOff, Search, X, Map, Printer, ArrowUpDown, Plus, Download } from "lucide-react";
+import { Mic, MicOff, Search, X, Map, Printer, ArrowUpDown, Plus, Download, FlaskConical } from "lucide-react";
 import { Link, useRoute } from "wouter";
 import type { Stop } from "../../../drizzle/schema";
 import {
@@ -67,6 +67,64 @@ function extractSurname(q: string): string {
   return words[words.length - 1] ?? q;
 }
 
+// ── Field test mode persists across reloads so a tester doesn't have to
+// re-enable it every session; read once at module scope guarded for SSR. ────
+const FIELD_TEST_MODE_STORAGE_KEY = "routelog:fieldTestMode";
+
+function readPersistedFieldTestMode(): boolean {
+  if (typeof localStorage === "undefined") return false;
+  try {
+    return localStorage.getItem(FIELD_TEST_MODE_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+// ── Route Intelligence fuzzy/phonetic/learned search ──────────────────────────
+// Minimum confidence to trust an RI result over (or ahead of) the deterministic
+// matching.ts hierarchy. Exact/phonetic index hits land at 0.85-0.98; a single
+// unconfirmed learned mapping is only 0.60 (see routeIntelligencePersistentLearning.ts) —
+// set high enough that one unconfirmed correction can't hijack a search, but low
+// enough that a 3rd+ confirmation (0.80+) or a real index match fires.
+const RI_CONFIDENCE_THRESHOLD = 0.8;
+
+/**
+ * Resolve a Route Intelligence SearchResult's stopId to an actual Stop in the
+ * current search pool. Returns null (and warns) instead of crashing when the
+ * stopId doesn't resolve — this happens for manually-saved "no match" entries
+ * from SaveNameModal, which persist a placeholder stopId of 0.
+ */
+function resolveRiStop(pool: Stop[], stopId: number): Stop | null {
+  if (!stopId || stopId <= 0) {
+    console.warn("[RI] Learned mapping resolved to a placeholder stopId — ignoring", stopId);
+    return null;
+  }
+  const stop = pool.find(s => s.id === stopId);
+  if (!stop) {
+    console.warn("[RI] Learned mapping stopId not found in current search pool — ignoring", stopId);
+    return null;
+  }
+  return stop;
+}
+
+/**
+ * Walk RI's confidence-sorted results and return the first one that resolves
+ * within the current search pool. The engine's dictionary spans the whole
+ * route, so in DELIVERY mode (pool scoped to the current box) the single
+ * top-confidence result may belong to a different box — that shouldn't
+ * discard the whole RI attempt if a lower-ranked result resolves in-pool.
+ * Results are sorted by confidence descending, so it's safe to stop as soon
+ * as confidence drops below threshold.
+ */
+function resolveFirstConfidentRiMatch(results: SearchResult[], pool: Stop[]): Stop | null {
+  for (const result of results) {
+    if (result.confidence < RI_CONFIDENCE_THRESHOLD) break;
+    const stop = resolveRiStop(pool, result.stopId);
+    if (stop) return stop;
+  }
+  return null;
+}
+
 export default function RouteView() {
   const [match, params] = useRoute("/route/:id");
   const routeIdParam = params?.id ? parseInt(params.id) : undefined;
@@ -94,7 +152,7 @@ export default function RouteView() {
   const [riDebugger] = useState(() => new RouteIntelligenceDebugger(riFeatureFlag.isEnabled()));
   const [riEnabled, setRiEnabled] = useState(riFeatureFlag.isEnabled());
   const [lastVoiceContext, setLastVoiceContext] = useState<VoiceSearchContext | null>(null);
-  const [fieldTestMode, setFieldTestMode] = useState(false);
+  const [fieldTestMode, setFieldTestMode] = useState(readPersistedFieldTestMode);
   const [searchStartTime, setSearchStartTime] = useState<number | null>(null);
   const [saveNameModalOpen, setSaveNameModalOpen] = useState(false);
   const [lastFailedVoiceTranscript, setLastFailedVoiceTranscript] = useState<string>("");
@@ -107,6 +165,23 @@ export default function RouteView() {
   // Only run when sections first load (length changes) — not when activeSectionId changes
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sections.length]);
+
+  // Persist field test mode so a tester doesn't need to re-enable it every session
+  useEffect(() => {
+    try {
+      localStorage.setItem(FIELD_TEST_MODE_STORAGE_KEY, String(fieldTestMode));
+    } catch {
+      // localStorage unavailable (private browsing, quota) — fieldTestMode still works in-memory
+    }
+  }, [fieldTestMode]);
+
+  const toggleFieldTestMode = useCallback(() => {
+    setFieldTestMode(v => {
+      const next = !v;
+      toast.success(next ? "Field test logging enabled" : "Field test logging disabled");
+      return next;
+    });
+  }, []);
 
   const currentSectionId = activeSectionId ?? sections[0]?.id ?? 0;
 
@@ -156,22 +231,56 @@ export default function RouteView() {
   // When a query is active, search ALL route stops; otherwise show current section only
   const isSearchActive = searchQuery.trim().length > 0;
 
+  // Search pool: DELIVERY mode scopes to the current section (box);
+  // SORTING/PARCEL modes search the entire route. Shared by the matcher
+  // and the status text below so the displayed count never lies about scope.
+  const searchPool = appMode === 'delivery' ? stops : (allRouteStops as Stop[]);
+
   // matchStops result memo — drives both visual filter and speech callback
   const matchResult = useMemo(() => {
     if (!isSearchActive) return null;
-    // In DELIVERY mode, search only the current section (box).
-    // In SORTING/PARCEL modes, search the entire route.
-    const pool = appMode === 'delivery' ? stops : (allRouteStops as Stop[]);
     const q = searchQuery.trim();
-    return matchStops(pool, q);
-  }, [isSearchActive, allRouteStops, stops, searchQuery, appMode]);
+    return matchStops(searchPool, q);
+  }, [isSearchActive, searchPool, searchQuery]);
 
-  const filteredStops = useMemo(() => {
+  const rankedMatchStops = useMemo(() => {
     if (!isSearchActive || !matchResult) return stops;
     // Rank results so primary-entity matches (card title = query) appear first.
     // Secondary-list inclusions (name buried in a business resident list) appear below.
     return rankMatchResults(matchResult.results, searchQuery);
   }, [isSearchActive, matchResult, stops, searchQuery]);
+
+  // Route Intelligence fuzzy/phonetic/learned lookup for the visual filter.
+  // Runs alongside the synchronous matching.ts pass above (which renders
+  // immediately) and, once resolved, promotes its match to the top of the
+  // list if matching.ts didn't already surface it. Never replaces or delays
+  // the deterministic result — only supplements it.
+  const [riVisualMatch, setRiVisualMatch] = useState<Stop | null>(null);
+
+  useEffect(() => {
+    setRiVisualMatch(null);
+    if (!isSearchActive || !riEngine || !riFeatureFlag.isEnabled()) return;
+
+    let cancelled = false;
+    const q = searchQuery.trim();
+    riEngine.search(q)
+      .then(results => {
+        if (cancelled) return;
+        const stop = resolveFirstConfidentRiMatch(results, searchPool);
+        if (stop) setRiVisualMatch(stop);
+      })
+      .catch(err => console.warn("[RI] Visual search failed:", err));
+
+    return () => { cancelled = true; };
+  }, [isSearchActive, riEngine, searchPool, searchQuery]);
+
+  const filteredStops = useMemo(() => {
+    if (!isSearchActive) return stops;
+    if (riVisualMatch && !rankedMatchStops.some(s => s.id === riVisualMatch.id)) {
+      return [riVisualMatch, ...rankedMatchStops];
+    }
+    return rankedMatchStops;
+  }, [isSearchActive, rankedMatchStops, stops, riVisualMatch]);
 
   const activeSection = sections.find(s => s.id === currentSectionId);
 
@@ -362,7 +471,7 @@ export default function RouteView() {
    * isFinal=true: stable result — process and speak.
    * isFinal=false: interim — update search bar only.
    */
-  const handleVoiceTranscript = useCallback((text: string, isFinal: boolean) => {
+  const handleVoiceTranscript = useCallback(async (text: string, isFinal: boolean) => {
     setSearchQuery(text);
 
     if (!isFinal) return;
@@ -419,6 +528,31 @@ export default function RouteView() {
       // Sorting/Parcel modes: search entire route
       if (allRouteStops.length === 0) return;
       pool = allRouteStops as Stop[];
+    }
+
+    // Route Intelligence: try the fuzzy/phonetic/learned-mapping engine first.
+    // A confident hit here means the speaker's pronunciation didn't match any
+    // exact substring/alias but was recognised anyway — speak it immediately
+    // and skip the deterministic hierarchy below. Gated behind riFeatureFlag
+    // so it can be switched off instantly without a redeploy if it misfires.
+    if (riEngine && riFeatureFlag.isEnabled()) {
+      try {
+        const riResults = await riEngine.search(q);
+        const stop = resolveFirstConfidentRiMatch(riResults, pool);
+        if (stop) {
+          const result = matchStop(stop, q);
+          const spokenName = resolveSpokenName(stop, result);
+          const speech = buildStopSpeech(stop, spokenName);
+          // matchLevel 3 ("broad/fuzzy") is the closest honest label for a
+          // non-exact RI resolution — field-test stats key off this level
+          // to report fuzzyMatchingUsed.
+          setLastVoiceContext(createVoiceSearchContext(q, 3, [stop]));
+          speakAndResume(speech);
+          return;
+        }
+      } catch (err) {
+        console.warn("[RI] Voice search failed, falling back to matching.ts:", err);
+      }
     }
 
     // Use the same matchStops 3-level hierarchy as the visual filter.
@@ -495,7 +629,8 @@ export default function RouteView() {
   // appMode controls search scope (delivery vs sorting/parcel)
   // stops and allRouteStops must be in deps to avoid stale closure (empty pool)
   // setLastVoiceContext must be in deps to capture voice context for learning
-  }, [buildStopSpeech, speakAndResume, appMode, stops, allRouteStops, currentSectionId, sections, setLastVoiceContext]);
+  // riEngine must be in deps so the RI-first attempt uses the current engine instance
+  }, [buildStopSpeech, speakAndResume, appMode, stops, allRouteStops, currentSectionId, sections, setLastVoiceContext, riEngine]);
 
   const {
     voiceState,
@@ -746,6 +881,17 @@ export default function RouteView() {
             >
               <Download size={17} />
             </button>
+            <button
+              onClick={toggleFieldTestMode}
+              title={fieldTestMode ? "Field test logging: ON — tap to disable" : "Field test logging: OFF — tap to enable"}
+              className={`p-2 rounded-full transition-colors ${
+                fieldTestMode
+                  ? "bg-accent text-accent-foreground"
+                  : "hover:bg-white/10"
+              }`}
+            >
+              <FlaskConical size={17} />
+            </button>
           </div>
         </div>
 
@@ -871,7 +1017,7 @@ export default function RouteView() {
             {dragMode
               ? `${stops.length} stops — drag to reorder`
               : isSearchActive
-              ? `${filteredStops.length} of ${allRouteStops.length} stops across route matching "${searchQuery}"`
+              ? `${filteredStops.length} of ${searchPool.length} stops ${appMode === 'delivery' ? 'in this box' : 'across route'} matching "${searchQuery}"`
               : `${stops.length} stops in this section`
             }
           </>
@@ -960,7 +1106,9 @@ export default function RouteView() {
         {!dragMode && (
           <p className="text-center text-xs text-muted-foreground/50 mt-2 pb-2">
             {isSearchActive
-              ? `Searching all ${allRouteStops.length} stops across the route`
+              ? appMode === 'delivery'
+                ? `Searching ${searchPool.length} stops in this box`
+                : `Searching all ${searchPool.length} stops across the route`
               : activeSection ? "Tap ⇅ to enter reorder mode and insert stops at any position" : ""}
           </p>
         )}
@@ -975,7 +1123,7 @@ export default function RouteView() {
             routeId,
             stopId,
             transcript,
-            transcript
+            normalizeTranscript(transcript)
           );
           toast.success(`Saved: "${transcript}" → ${stopName}`);
         }}

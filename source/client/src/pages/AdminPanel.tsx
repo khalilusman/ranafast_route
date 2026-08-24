@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { BarChart3, Settings, Zap, TrendingUp } from "lucide-react";
+import { trpc } from "@/lib/trpc";
 import FieldTestingDashboard from "@/components/FieldTestingDashboard";
 import LearnedMappingsManager from "@/components/LearnedMappingsManager";
 import RouteIntelligenceConfig from "@/components/RouteIntelligenceConfig";
@@ -9,6 +10,8 @@ type TabType = "field-testing" | "learned-mappings" | "ri-config" | "analytics";
 
 export default function AdminPanel() {
   const [activeTab, setActiveTab] = useState<TabType>("field-testing");
+  const [selectedRouteId, setSelectedRouteId] = useState<number | null>(null);
+  const { data: routes = [] } = trpc.routes.list.useQuery();
 
   const tabs: Array<{
     id: TabType;
@@ -84,10 +87,33 @@ export default function AdminPanel() {
             <div className="mb-6">
               <h2 className="text-2xl font-bold text-foreground">Field Testing Dashboard</h2>
               <p className="text-muted-foreground mt-1">
-                Monitor Route Intelligence performance during live testing on Ranafast (Test) route
+                Monitor Route Intelligence performance during live testing
               </p>
             </div>
-            <FieldTestingDashboard routeId={0} hoursAgo={24} />
+            <div className="p-6 bg-card rounded-lg border border-border mb-6">
+              <label className="block text-sm font-semibold text-foreground mb-2">
+                Select Route
+              </label>
+              <select
+                value={selectedRouteId ?? ""}
+                onChange={e => setSelectedRouteId(e.target.value ? parseInt(e.target.value) : null)}
+                className="w-full px-4 py-2 bg-background border border-border rounded-lg text-foreground"
+              >
+                <option value="">Choose a route...</option>
+                {routes.map(route => (
+                  <option key={route.id} value={route.id}>
+                    {route.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {selectedRouteId ? (
+              <FieldTestingDashboard routeId={selectedRouteId} hoursAgo={24} />
+            ) : (
+              <div className="p-6 bg-muted rounded-lg text-center text-muted-foreground">
+                Select a route above to view its field testing data.
+              </div>
+            )}
           </div>
         )}
 
