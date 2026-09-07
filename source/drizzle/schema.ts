@@ -1,10 +1,12 @@
 import {
   boolean,
   int,
+  json,
   mysqlEnum,
   mysqlTable,
   text,
   timestamp,
+  uniqueIndex,
   varchar,
 } from "drizzle-orm/mysql-core";
 
@@ -74,3 +76,32 @@ export const stops = mysqlTable("stops", {
 
 export type Stop = typeof stops.$inferSelect;
 export type InsertStop = typeof stops.$inferInsert;
+
+// ─── Learned Mapping ──────────────────────────────────────────────────────────
+// Shared, server-side counterpart to the per-device IndexedDB learning cache
+// (client/src/lib/routeIntelligencePersistentLearning.ts) — lets voice-search
+// corrections sync across postmen and devices on the same route.
+export const learnedMappings = mysqlTable(
+  "learnedMappings",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    routeId: int("routeId").notNull(),
+    stopId: int("stopId").notNull(),
+    originalTranscript: varchar("originalTranscript", { length: 255 }).notNull(),
+    normalizedTranscript: varchar("normalizedTranscript", { length: 255 }).notNull(),
+    firstConfirmedAt: timestamp("firstConfirmedAt").defaultNow().notNull(),
+    lastConfirmedAt: timestamp("lastConfirmedAt").defaultNow().notNull(),
+    confirmationCount: int("confirmationCount").default(1).notNull(),
+    tags: json("tags").$type<string[]>(),
+  },
+  table => ({
+    routeStopTranscriptIdx: uniqueIndex("learnedMappings_route_stop_transcript_idx").on(
+      table.routeId,
+      table.stopId,
+      table.normalizedTranscript
+    ),
+  })
+);
+
+export type LearnedMappingRow = typeof learnedMappings.$inferSelect;
+export type InsertLearnedMappingRow = typeof learnedMappings.$inferInsert;

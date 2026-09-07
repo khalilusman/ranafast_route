@@ -55,7 +55,7 @@ A mobile-first web application for postmen to manage delivery routes with voice 
 | **Storage** | IndexedDB (local learning), S3 (file uploads) |
 | **Maps** | Google Maps API (via Manus proxy) |
 | **Testing** | Vitest (204 tests) |
-| **Auth** | Manus OAuth 2.0 |
+| **Auth** | Passcode login + signed JWT session cookie |
 
 ---
 
@@ -97,7 +97,7 @@ maghery-route/
 │   ├── buildStopSpeech.ts                  # Voice callback generation
 │   ├── boxSwitching.ts                     # Box number logic
 │   ├── auth.logout.test.ts                 # Auth tests
-│   └── _core/                              # Framework (OAuth, context, etc.)
+│   └── _core/                              # Framework (auth, context, etc.)
 ├── drizzle/
 │   ├── schema.ts                           # Database tables
 │   └── migrations/                         # SQL migrations
@@ -178,12 +178,10 @@ Dev server runs on **http://localhost:3000**
 
 ### Environment Variables
 
-Required secrets (managed via Manus):
+Required secrets:
 - `DATABASE_URL` — MySQL/TiDB connection string
 - `JWT_SECRET` — Session signing secret
-- `VITE_APP_ID` — Manus OAuth application ID
-- `OAUTH_SERVER_URL` — Manus OAuth backend
-- `VITE_OAUTH_PORTAL_URL` — Manus login portal
+- `ADMIN_PASSCODE` — Passcode for admin login (`POST /api/admin/login`)
 - `BUILT_IN_FORGE_API_KEY` — Manus built-in APIs (server-side)
 - `VITE_FRONTEND_FORGE_API_KEY` — Manus built-in APIs (client-side)
 

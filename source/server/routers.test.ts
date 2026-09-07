@@ -82,6 +82,67 @@ describe("stops.search", () => {
   });
 });
 
+describe("corrections.lookup", () => {
+  it("returns null when DB is unavailable", async () => {
+    const caller = appRouter.createCaller(makeCtx());
+    const result = await caller.corrections.lookup({
+      routeId: 1,
+      normalizedTranscript: "michael",
+    });
+    expect(result).toBeNull();
+  });
+});
+
+describe("corrections.listForRoute", () => {
+  it("returns empty array when DB is unavailable", async () => {
+    const caller = appRouter.createCaller(makeCtx());
+    const result = await caller.corrections.listForRoute({ routeId: 1 });
+    expect(result).toEqual([]);
+  });
+});
+
+describe("corrections.record", () => {
+  it("is public (no auth required) but throws when DB is unavailable", async () => {
+    const caller = appRouter.createCaller(makeCtx());
+    await expect(
+      caller.corrections.record({
+        routeId: 1,
+        stopId: 10,
+        originalTranscript: "Michael",
+        normalizedTranscript: "michael",
+      })
+    ).rejects.toThrow("DB unavailable");
+  });
+
+  it("rejects an empty normalizedTranscript", async () => {
+    const caller = appRouter.createCaller(makeCtx());
+    await expect(
+      caller.corrections.record({
+        routeId: 1,
+        stopId: 10,
+        originalTranscript: "Michael",
+        normalizedTranscript: "",
+      })
+    ).rejects.toThrow();
+  });
+});
+
+describe("corrections.delete", () => {
+  it("is public (no auth required) but throws when DB is unavailable", async () => {
+    const caller = appRouter.createCaller(makeCtx());
+    await expect(caller.corrections.delete({ id: 1 })).rejects.toThrow("DB unavailable");
+  });
+});
+
+describe("corrections.clearForRoute", () => {
+  it("is public (no auth required) but throws when DB is unavailable", async () => {
+    const caller = appRouter.createCaller(makeCtx());
+    await expect(caller.corrections.clearForRoute({ routeId: 1 })).rejects.toThrow(
+      "DB unavailable"
+    );
+  });
+});
+
 describe("routes.getPublicSummary", () => {
   it("returns null for unknown token when DB is unavailable", async () => {
     const caller = appRouter.createCaller(makeCtx());

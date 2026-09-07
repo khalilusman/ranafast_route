@@ -1,22 +1,26 @@
 /**
  * Persistent Learning System for Route Intelligence
- * 
+ *
  * Stores explicit user corrections (speech transcript → stop ID) with confirmation counts.
- * Learned mappings survive app restarts and improve search accuracy over time.
- * 
+ * The server (`corrections` tRPC router) is the source of truth, so corrections sync
+ * across every postman/device on a route. IndexedDB is kept only as a local cache that
+ * this module falls back to when a network request fails (e.g. no signal in the field).
+ *
  * Learning is triggered ONLY when:
  * 1. Voice search finds no exact match (level 0 or low confidence)
  * 2. User manually selects a stop from the results
  * 3. System records: original transcript, normalized transcript, stop ID, route ID, timestamp
- * 
+ *
  * On future searches:
  * 1. Check learned mappings first (highest priority)
  * 2. If no learned mapping, run fuzzy matching
  * 3. Learned mappings are separate from the permanent route dictionary
  */
 
+import { trpcVanilla } from "./trpc";
+
 export interface LearnedMapping {
-  id: string; // UUID
+  id: number;
   routeId: number;
   stopId: number;
   originalTranscript: string; // Raw speech-to-text output
@@ -35,8 +39,18 @@ export interface LearnedMappingLookupResult {
 }
 
 const DB_NAME = "RouteIntelligence";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = "learnedMappings";
+
+// Local-only fallback records (created while offline) get negative ids so they
+// never collide with a real server-assigned (positive, autoincrement) id. A
+// monotonic counter (rather than -Date.now()) keeps ids unique even when two
+// corrections are recorded within the same millisecond.
+let localIdCounter = 0;
+function localOnlyId(): number {
+  localIdCounter -= 1;
+  return localIdCounter;
+}
 
 /**
  * Initialize IndexedDB and create schema if needed
@@ -51,33 +65,48 @@ export async function initializeLearningDB(): Promise<IDBDatabase> {
     request.onupgradeneeded = (event) => {
       const db = (event.target as IDBOpenDBRequest).result;
 
-      // Create learnedMappings object store
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        const store = db.createObjectStore(STORE_NAME, { keyPath: "id" });
-        // Indexes for efficient querying
-        store.createIndex("routeId", "routeId", { unique: false });
-        store.createIndex("stopId", "stopId", { unique: false });
-        store.createIndex("normalizedTranscript", "normalizedTranscript", {
-          unique: false,
-        });
-        store.createIndex("routeId_stopId", ["routeId", "stopId"], {
-          unique: false,
-        });
+      if (db.objectStoreNames.contains(STORE_NAME)) {
+        db.deleteObjectStore(STORE_NAME);
       }
+
+      const store = db.createObjectStore(STORE_NAME, { keyPath: "id" });
+      store.createIndex("routeId", "routeId", { unique: false });
+      store.createIndex("stopId", "stopId", { unique: false });
+      store.createIndex("normalizedTranscript", "normalizedTranscript", {
+        unique: false,
+      });
+      store.createIndex("routeId_stopId", ["routeId", "stopId"], {
+        unique: false,
+      });
     };
   });
 }
 
-/**
- * Record a user correction: when user manually selects a stop after no exact match
- * 
- * @param routeId - ID of the route
- * @param stopId - ID of the selected stop
- * @param originalTranscript - Raw speech-to-text output
- * @param normalizedTranscript - Normalized for comparison
- * @param tags - Optional tags (e.g., "pronunciation", "abbreviation")
- */
-export async function recordCorrection(
+// ── Local IndexedDB helpers (offline cache / fallback only) ──────────────────
+
+async function cacheMappingLocally(mapping: LearnedMapping): Promise<void> {
+  const db = await initializeLearningDB();
+  return new Promise((resolve, reject) => {
+    const store = db.transaction([STORE_NAME], "readwrite").objectStore(STORE_NAME);
+    const request = store.put(mapping);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function cacheMappingsLocally(mappings: LearnedMapping[]): Promise<void> {
+  if (mappings.length === 0) return;
+  const db = await initializeLearningDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], "readwrite");
+    const store = transaction.objectStore(STORE_NAME);
+    mappings.forEach(mapping => store.put(mapping));
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+}
+
+async function recordCorrectionLocally(
   routeId: number,
   stopId: number,
   originalTranscript: string,
@@ -91,30 +120,26 @@ export async function recordCorrection(
     const store = transaction.objectStore(STORE_NAME);
     const index = store.index("normalizedTranscript");
 
-    // Check if this normalized transcript already exists for this route+stop
     const query = IDBKeyRange.only(normalizedTranscript);
     const findRequest = index.getAll(query);
 
     findRequest.onsuccess = () => {
       const existing = findRequest.result.find(
-        (m: LearnedMapping) =>
-          m.routeId === routeId && m.stopId === stopId
+        (m: LearnedMapping) => m.routeId === routeId && m.stopId === stopId
       );
 
       const now = Date.now();
       let mapping: LearnedMapping;
 
       if (existing) {
-        // Increment confirmation count for existing mapping
         mapping = {
           ...existing,
           lastConfirmedAt: now,
           confirmationCount: existing.confirmationCount + 1,
         };
       } else {
-        // Create new mapping
         mapping = {
-          id: `${routeId}-${stopId}-${normalizedTranscript}-${now}`,
+          id: localOnlyId(),
           routeId,
           stopId,
           originalTranscript,
@@ -135,23 +160,14 @@ export async function recordCorrection(
   });
 }
 
-/**
- * Look up a learned mapping for a given normalized transcript and route
- * Returns the stop ID and confidence score if found
- * 
- * @param routeId - ID of the route
- * @param normalizedTranscript - Normalized transcript to look up
- * @returns LearnedMappingLookupResult or null if not found
- */
-export async function lookupLearnedMapping(
+async function lookupLearnedMappingLocally(
   routeId: number,
   normalizedTranscript: string
 ): Promise<LearnedMappingLookupResult | null> {
   const db = await initializeLearningDB();
 
   return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], "readonly");
-    const store = transaction.objectStore(STORE_NAME);
+    const store = db.transaction([STORE_NAME], "readonly").objectStore(STORE_NAME);
     const index = store.index("normalizedTranscript");
 
     const query = IDBKeyRange.only(normalizedTranscript);
@@ -167,13 +183,10 @@ export async function lookupLearnedMapping(
         return;
       }
 
-      // Use the most recently confirmed mapping (highest confidence)
       const best = mappings.reduce((a: LearnedMapping, b: LearnedMapping) =>
         a.confirmationCount > b.confirmationCount ? a : b
       );
 
-      // Confidence: 0-1 scale based on confirmation count
-      // 1 confirmation = 0.5, 2 = 0.65, 3 = 0.75, 4+ = 0.85
       const confidence = Math.min(0.5 + best.confirmationCount * 0.1, 0.85);
 
       resolve({
@@ -188,20 +201,13 @@ export async function lookupLearnedMapping(
   });
 }
 
-/**
- * Get all learned mappings for a specific route (for admin inspection)
- * 
- * @param routeId - ID of the route
- * @returns Array of learned mappings
- */
-export async function getAllLearnedMappingsForRoute(
+async function getAllLearnedMappingsForRouteLocally(
   routeId: number
 ): Promise<LearnedMapping[]> {
   const db = await initializeLearningDB();
 
   return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], "readonly");
-    const store = transaction.objectStore(STORE_NAME);
+    const store = db.transaction([STORE_NAME], "readonly").objectStore(STORE_NAME);
     const index = store.index("routeId");
 
     const query = IDBKeyRange.only(routeId);
@@ -209,7 +215,6 @@ export async function getAllLearnedMappingsForRoute(
 
     request.onsuccess = () => {
       const mappings = request.result as LearnedMapping[];
-      // Sort by confirmation count (descending) then by last confirmed time
       mappings.sort((a, b) => {
         if (b.confirmationCount !== a.confirmationCount) {
           return b.confirmationCount - a.confirmationCount;
@@ -223,17 +228,11 @@ export async function getAllLearnedMappingsForRoute(
   });
 }
 
-/**
- * Delete a learned mapping (for admin cleanup)
- * 
- * @param mappingId - ID of the mapping to delete
- */
-export async function deleteLearnedMapping(mappingId: string): Promise<void> {
+async function deleteLearnedMappingLocally(mappingId: number): Promise<void> {
   const db = await initializeLearningDB();
 
   return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], "readwrite");
-    const store = transaction.objectStore(STORE_NAME);
+    const store = db.transaction([STORE_NAME], "readwrite").objectStore(STORE_NAME);
     const request = store.delete(mappingId);
 
     request.onsuccess = () => resolve();
@@ -241,19 +240,11 @@ export async function deleteLearnedMapping(mappingId: string): Promise<void> {
   });
 }
 
-/**
- * Clear all learned mappings for a specific route (for testing/reset)
- * 
- * @param routeId - ID of the route
- */
-export async function clearLearnedMappingsForRoute(
-  routeId: number
-): Promise<void> {
+async function clearLearnedMappingsForRouteLocally(routeId: number): Promise<void> {
   const db = await initializeLearningDB();
 
   return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], "readwrite");
-    const store = transaction.objectStore(STORE_NAME);
+    const store = db.transaction([STORE_NAME], "readwrite").objectStore(STORE_NAME);
     const index = store.index("routeId");
 
     const query = IDBKeyRange.only(routeId);
@@ -271,6 +262,93 @@ export async function clearLearnedMappingsForRoute(
 
     request.onerror = () => reject(request.error);
   });
+}
+
+// ── Public API: server is the source of truth, IndexedDB is the fallback ────
+
+/**
+ * Record a user correction: when user manually selects a stop after no exact match.
+ * Saves to the server first (so it syncs to every device on the route); if that
+ * request fails, falls back to the local IndexedDB cache.
+ */
+export async function recordCorrection(
+  routeId: number,
+  stopId: number,
+  originalTranscript: string,
+  normalizedTranscript: string,
+  tags?: string[]
+): Promise<LearnedMapping> {
+  try {
+    const mapping = await trpcVanilla.corrections.record.mutate({
+      routeId,
+      stopId,
+      originalTranscript,
+      normalizedTranscript,
+      tags,
+    });
+    cacheMappingLocally(mapping).catch(err =>
+      console.warn("[Learning] Failed to cache correction locally:", err)
+    );
+    return mapping;
+  } catch (error) {
+    console.warn("[Learning] Server record failed, falling back to local cache:", error);
+    return recordCorrectionLocally(routeId, stopId, originalTranscript, normalizedTranscript, tags);
+  }
+}
+
+/**
+ * Look up a learned mapping for a given normalized transcript and route.
+ * A `null` server response (no mapping found) is authoritative and returned
+ * as-is; only a failed request falls back to the local cache.
+ */
+export async function lookupLearnedMapping(
+  routeId: number,
+  normalizedTranscript: string
+): Promise<LearnedMappingLookupResult | null> {
+  try {
+    return await trpcVanilla.corrections.lookup.query({ routeId, normalizedTranscript });
+  } catch (error) {
+    console.warn("[Learning] Server lookup failed, falling back to local cache:", error);
+    return lookupLearnedMappingLocally(routeId, normalizedTranscript);
+  }
+}
+
+/**
+ * Get all learned mappings for a specific route (for admin inspection).
+ */
+export async function getAllLearnedMappingsForRoute(
+  routeId: number
+): Promise<LearnedMapping[]> {
+  try {
+    const mappings = await trpcVanilla.corrections.listForRoute.query({ routeId });
+    cacheMappingsLocally(mappings).catch(err =>
+      console.warn("[Learning] Failed to cache mappings locally:", err)
+    );
+    return mappings;
+  } catch (error) {
+    console.warn("[Learning] Server listForRoute failed, falling back to local cache:", error);
+    return getAllLearnedMappingsForRouteLocally(routeId);
+  }
+}
+
+/**
+ * Delete a learned mapping (for admin cleanup).
+ */
+export async function deleteLearnedMapping(mappingId: number): Promise<void> {
+  await trpcVanilla.corrections.delete.mutate({ id: mappingId });
+  await deleteLearnedMappingLocally(mappingId).catch(err =>
+    console.warn("[Learning] Failed to delete cached copy locally:", err)
+  );
+}
+
+/**
+ * Clear all learned mappings for a specific route (for testing/reset).
+ */
+export async function clearLearnedMappingsForRoute(routeId: number): Promise<void> {
+  await trpcVanilla.corrections.clearForRoute.mutate({ routeId });
+  await clearLearnedMappingsForRouteLocally(routeId).catch(err =>
+    console.warn("[Learning] Failed to clear cached copies locally:", err)
+  );
 }
 
 /**

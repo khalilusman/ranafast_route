@@ -4,9 +4,23 @@ import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
 import { TRPCError } from "@trpc/server";
 import { getDb } from "./db";
-import { routes, sections, stops } from "../drizzle/schema";
-import { eq, and, like, or, asc, gt, desc } from "drizzle-orm";
+import { learnedMappings, routes, sections, stops } from "../drizzle/schema";
+import { eq, and, like, or, asc, gt, desc, sql } from "drizzle-orm";
 import { z } from "zod";
+
+function toLearnedMapping(row: typeof learnedMappings.$inferSelect) {
+  return {
+    id: row.id,
+    routeId: row.routeId,
+    stopId: row.stopId,
+    originalTranscript: row.originalTranscript,
+    normalizedTranscript: row.normalizedTranscript,
+    firstConfirmedAt: row.firstConfirmedAt.getTime(),
+    lastConfirmedAt: row.lastConfirmedAt.getTime(),
+    confirmationCount: row.confirmationCount,
+    tags: row.tags ?? [],
+  };
+}
 
 // ── Route helpers ─────────────────────────────────────────────────────────────
 // ── Demo Data Fallback for offline/local testing without MySQL DB ──────────────
@@ -162,6 +176,128 @@ export const appRouter = router({
       ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
       return { success: true } as const;
     }),
+  }),
+
+  // ── Corrections (shared learned-mapping cache) ───────────────────────────────
+  // Public: same trust model as sections/stops/routes below — postmen record
+  // and look up voice-search corrections without logging in.
+  corrections: router({
+    record: publicProcedure
+      .input(z.object({
+        routeId: z.number(),
+        stopId: z.number(),
+        originalTranscript: z.string().min(1),
+        normalizedTranscript: z.string().min(1),
+        tags: z.array(z.string()).optional(),
+      }))
+      .mutation(async ({ input }) => {
+        const db = await getDb();
+        if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "DB unavailable" });
+
+        const now = new Date();
+        await db
+          .insert(learnedMappings)
+          .values({
+            routeId: input.routeId,
+            stopId: input.stopId,
+            originalTranscript: input.originalTranscript,
+            normalizedTranscript: input.normalizedTranscript,
+            firstConfirmedAt: now,
+            lastConfirmedAt: now,
+            confirmationCount: 1,
+            tags: input.tags ?? [],
+          })
+          .onDuplicateKeyUpdate({
+            set: {
+              lastConfirmedAt: now,
+              confirmationCount: sql`${learnedMappings.confirmationCount} + 1`,
+            },
+          });
+
+        const [row] = await db
+          .select()
+          .from(learnedMappings)
+          .where(
+            and(
+              eq(learnedMappings.routeId, input.routeId),
+              eq(learnedMappings.stopId, input.stopId),
+              eq(learnedMappings.normalizedTranscript, input.normalizedTranscript)
+            )
+          )
+          .limit(1);
+
+        if (!row) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Failed to save correction" });
+        return toLearnedMapping(row);
+      }),
+
+    lookup: publicProcedure
+      .input(z.object({
+        routeId: z.number(),
+        normalizedTranscript: z.string().min(1),
+      }))
+      .query(async ({ input }) => {
+        const db = await getDb();
+        if (!db) return null;
+
+        const rows = await db
+          .select()
+          .from(learnedMappings)
+          .where(
+            and(
+              eq(learnedMappings.routeId, input.routeId),
+              eq(learnedMappings.normalizedTranscript, input.normalizedTranscript)
+            )
+          );
+
+        if (rows.length === 0) return null;
+
+        const best = rows.reduce((a, b) => (a.confirmationCount > b.confirmationCount ? a : b));
+        const confidence = Math.min(0.5 + best.confirmationCount * 0.1, 0.85);
+
+        return {
+          stopId: best.stopId,
+          confidence,
+          confirmationCount: best.confirmationCount,
+          lastConfirmedAt: best.lastConfirmedAt.getTime(),
+        };
+      }),
+
+    listForRoute: publicProcedure
+      .input(z.object({ routeId: z.number() }))
+      .query(async ({ input }) => {
+        const db = await getDb();
+        if (!db) return [];
+
+        const rows = await db
+          .select()
+          .from(learnedMappings)
+          .where(eq(learnedMappings.routeId, input.routeId));
+
+        return rows.map(toLearnedMapping).sort((a, b) => {
+          if (b.confirmationCount !== a.confirmationCount) {
+            return b.confirmationCount - a.confirmationCount;
+          }
+          return b.lastConfirmedAt - a.lastConfirmedAt;
+        });
+      }),
+
+    delete: publicProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ input }) => {
+        const db = await getDb();
+        if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "DB unavailable" });
+        await db.delete(learnedMappings).where(eq(learnedMappings.id, input.id));
+        return { success: true } as const;
+      }),
+
+    clearForRoute: publicProcedure
+      .input(z.object({ routeId: z.number() }))
+      .mutation(async ({ input }) => {
+        const db = await getDb();
+        if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "DB unavailable" });
+        await db.delete(learnedMappings).where(eq(learnedMappings.routeId, input.routeId));
+        return { success: true } as const;
+      }),
   }),
 
   // ── Sections ────────────────────────────────────────────────────────────────

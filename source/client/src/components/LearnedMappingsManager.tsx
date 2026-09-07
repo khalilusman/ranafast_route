@@ -1,46 +1,35 @@
-import { useEffect, useState } from "react";
-import { Trash2, RefreshCw, Download } from "lucide-react";
+import { useState } from "react";
+import { Trash2, Download } from "lucide-react";
 import { toast } from "sonner";
 import { trpc } from "@/lib/trpc";
-import {
-  getAllLearnedMappingsForRoute,
-  deleteLearnedMapping,
-  clearLearnedMappingsForRoute,
-  type LearnedMapping,
-} from "@/lib/routeIntelligencePersistentLearning";
 
 export default function LearnedMappingsManager() {
   const [selectedRoute, setSelectedRoute] = useState<number | null>(null);
-  const [mappings, setMappings] = useState<LearnedMapping[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
 
-  // Fetch routes
   const { data: routes = [] } = trpc.routes.list.useQuery();
+  const utils = trpc.useUtils();
 
-  // Load mappings when route is selected
-  useEffect(() => {
-    if (!selectedRoute) return;
+  const { data: mappings = [], isLoading } = trpc.corrections.listForRoute.useQuery(
+    { routeId: selectedRoute ?? 0 },
+    { enabled: selectedRoute !== null }
+  );
 
-    const loadMappings = async () => {
-      setIsLoading(true);
-      try {
-        const data = await getAllLearnedMappingsForRoute(selectedRoute);
-        setMappings(data);
-      } catch (err) {
-        console.error("[LearnedMappingsManager] Failed to load mappings:", err);
-        toast.error("Failed to load learned mappings");
-      } finally {
-        setIsLoading(false);
-      }
-    };
+  const invalidateMappings = () => {
+    if (selectedRoute !== null) {
+      utils.corrections.listForRoute.invalidate({ routeId: selectedRoute });
+    }
+  };
 
-    loadMappings();
-  }, [selectedRoute]);
+  const deleteMutation = trpc.corrections.delete.useMutation({
+    onSuccess: invalidateMappings,
+  });
+  const clearMutation = trpc.corrections.clearForRoute.useMutation({
+    onSuccess: invalidateMappings,
+  });
 
-  const handleDeleteMapping = async (id: string) => {
+  const handleDeleteMapping = async (id: number) => {
     try {
-      await deleteLearnedMapping(id);
-      setMappings(prev => prev.filter(m => m.id !== id));
+      await deleteMutation.mutateAsync({ id });
       toast.success("Mapping deleted");
     } catch (err) {
       console.error("[LearnedMappingsManager] Failed to delete mapping:", err);
@@ -53,8 +42,7 @@ export default function LearnedMappingsManager() {
     if (!confirm("Clear all learned mappings for this route? This cannot be undone.")) return;
 
     try {
-      await clearLearnedMappingsForRoute(selectedRoute);
-      setMappings([]);
+      await clearMutation.mutateAsync({ routeId: selectedRoute });
       toast.success("All mappings cleared");
     } catch (err) {
       console.error("[LearnedMappingsManager] Failed to clear mappings:", err);

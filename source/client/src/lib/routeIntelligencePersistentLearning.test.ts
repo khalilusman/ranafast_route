@@ -1,408 +1,288 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import {
-  recordCorrection,
-  lookupLearnedMapping,
-  getAllLearnedMappingsForRoute,
-  deleteLearnedMapping,
-  clearLearnedMappingsForRoute,
-  getLearnedMappingsStats,
-  LearnedMapping,
-} from "./routeIntelligencePersistentLearning";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 
-/**
- * Mock IndexedDB for testing
- * Since IndexedDB is not available in Node.js test environment,
- * we use an in-memory store that mimics IndexedDB behavior
- */
-
-interface MockStore {
-  [key: string]: LearnedMapping;
-}
-
-let mockStore: MockStore = {};
-
-// Mock indexedDB globally for tests
-const mockIndexedDB = {
-  open: vi.fn((dbName: string, version: number) => {
-    return {
-      onsuccess: null as any,
-      onerror: null as any,
-      onupgradeneeded: null as any,
-      result: {
-        objectStoreNames: {
-          contains: (name: string) => false,
-        },
-        createObjectStore: vi.fn((name: string, options: any) => ({
-          createIndex: vi.fn(),
-        })),
-        transaction: (storeNames: string[], mode: string) => ({
-          objectStore: (name: string) => ({
-            put: (mapping: LearnedMapping) => ({
-              onsuccess: null as any,
-              onerror: null as any,
-            }),
-            delete: (id: string) => ({
-              onsuccess: null as any,
-              onerror: null as any,
-            }),
-            get: (id: string) => ({
-              onsuccess: null as any,
-              onerror: null as any,
-            }),
-            index: (indexName: string) => ({
-              getAll: (range?: any) => ({
-                onsuccess: null as any,
-                onerror: null as any,
-                result: [] as LearnedMapping[],
-              }),
-              openCursor: (range?: any) => ({
-                onsuccess: null as any,
-                onerror: null as any,
-              }),
-            }),
-          }),
-        }),
-      },
-    };
-  }),
+// ── Mock the vanilla tRPC client so we can drive the server-first/fallback
+// behavior deterministically without a real network or backend. Vitest hoists
+// vi.mock factories above other module code, so the referenced variable must
+// be prefixed with "mock" to be usable inside the factory. ──────────────────
+const mockCorrections = {
+  record: { mutate: vi.fn() },
+  lookup: { query: vi.fn() },
+  listForRoute: { query: vi.fn() },
+  delete: { mutate: vi.fn() },
+  clearForRoute: { mutate: vi.fn() },
 };
 
-// Simplified in-memory implementation for testing
-class InMemoryLearningStore {
-  private store: Map<string, LearnedMapping> = new Map();
+vi.mock("./trpc", () => ({
+  trpcVanilla: { corrections: mockCorrections },
+}));
 
-  async recordCorrection(
-    routeId: number,
-    stopId: number,
-    originalTranscript: string,
-    normalizedTranscript: string,
-    tags?: string[]
-  ): Promise<LearnedMapping> {
-    const now = Date.now();
-    const key = `${routeId}-${normalizedTranscript}`;
+const corrections = mockCorrections;
 
-    const existing = Array.from(this.store.values()).find(
-      (m) =>
-        m.routeId === routeId &&
-        m.stopId === stopId &&
-        m.normalizedTranscript === normalizedTranscript
-    );
-
-    if (existing) {
-      const updated = {
-        ...existing,
-        lastConfirmedAt: now,
-        confirmationCount: existing.confirmationCount + 1,
-      };
-      this.store.set(existing.id, updated);
-      return updated;
+// ── Minimal fake IndexedDB, just enough to back the module's local-cache
+// fallback (put / delete / index.getAll / index.openCursor). ────────────────
+function createFakeIndexedDB() {
+  const store = new Map<number, any>();
+  const request = () => ({ onsuccess: null as any, onerror: null as any, result: undefined as any });
+  const resolve = (req: any, result: any) => {
+    req.result = result;
+    queueMicrotask(() => req.onsuccess?.({ target: req }));
+  };
+  const matches = (item: any, indexName: string, value: any) => {
+    if (indexName === "routeId_stopId") {
+      const [routeId, stopId] = value;
+      return item.routeId === routeId && item.stopId === stopId;
     }
+    return item[indexName] === value;
+  };
 
-    const mapping: LearnedMapping = {
-      id: `${routeId}-${stopId}-${normalizedTranscript}-${now}`,
-      routeId,
-      stopId,
-      originalTranscript,
-      normalizedTranscript,
-      firstConfirmedAt: now,
-      lastConfirmedAt: now,
-      confirmationCount: 1,
-      tags: tags || [],
-    };
+  const fakeDb: any = {
+    objectStoreNames: { contains: () => true },
+    deleteObjectStore: () => {},
+    createObjectStore: () => ({ createIndex: () => {} }),
+    transaction: () => ({
+      objectStore: () => ({
+        put: (value: any) => {
+          const req = request();
+          store.set(value.id, value);
+          resolve(req, value.id);
+          return req;
+        },
+        delete: (id: number) => {
+          const req = request();
+          store.delete(id);
+          resolve(req, undefined);
+          return req;
+        },
+        index: (indexName: string) => ({
+          getAll: (range?: { only: any }) => {
+            const req = request();
+            const all = Array.from(store.values());
+            resolve(req, range ? all.filter(item => matches(item, indexName, range.only)) : all);
+            return req;
+          },
+          openCursor: (range?: { only: any }) => {
+            const req = request();
+            const entries = Array.from(store.entries()).filter(([, item]) =>
+              range ? matches(item, indexName, range.only) : true
+            );
+            let i = 0;
+            const step = () => {
+              if (i < entries.length) {
+                const [key, value] = entries[i]!;
+                req.result = {
+                  value,
+                  delete: () => store.delete(key),
+                  continue: () => {
+                    i++;
+                    queueMicrotask(() => req.onsuccess?.({ target: req }));
+                  },
+                };
+              } else {
+                req.result = null;
+              }
+              queueMicrotask(() => req.onsuccess?.({ target: req }));
+            };
+            step();
+            return req;
+          },
+        }),
+      }),
+    }),
+  };
 
-    this.store.set(mapping.id, mapping);
-    return mapping;
-  }
-
-  async lookupLearnedMapping(
-    routeId: number,
-    normalizedTranscript: string
-  ): Promise<{ stopId: number; confidence: number; confirmationCount: number; lastConfirmedAt: number } | null> {
-    const mappings = Array.from(this.store.values()).filter(
-      (m) => m.routeId === routeId && m.normalizedTranscript === normalizedTranscript
-    );
-
-    if (mappings.length === 0) return null;
-
-    const best = mappings.reduce((a, b) =>
-      a.confirmationCount > b.confirmationCount ? a : b
-    );
-
-    const confidence = Math.min(0.5 + best.confirmationCount * 0.1, 0.85);
-
-    return {
-      stopId: best.stopId,
-      confidence,
-      confirmationCount: best.confirmationCount,
-      lastConfirmedAt: best.lastConfirmedAt,
-    };
-  }
-
-  async getAllLearnedMappingsForRoute(routeId: number): Promise<LearnedMapping[]> {
-    const mappings = Array.from(this.store.values())
-      .filter((m) => m.routeId === routeId)
-      .sort((a, b) => {
-        if (b.confirmationCount !== a.confirmationCount) {
-          return b.confirmationCount - a.confirmationCount;
-        }
-        return b.lastConfirmedAt - a.lastConfirmedAt;
+  return {
+    open: () => {
+      const req: any = { onsuccess: null, onerror: null, onupgradeneeded: null, result: fakeDb };
+      queueMicrotask(() => {
+        req.onupgradeneeded?.({ target: { result: fakeDb } });
+        req.onsuccess?.({ target: req });
       });
-
-    return mappings;
-  }
-
-  async deleteLearnedMapping(mappingId: string): Promise<void> {
-    this.store.delete(mappingId);
-  }
-
-  async clearLearnedMappingsForRoute(routeId: number): Promise<void> {
-    const idsToDelete = Array.from(this.store.entries())
-      .filter(([_, m]) => m.routeId === routeId)
-      .map(([id, _]) => id);
-
-    idsToDelete.forEach((id) => this.store.delete(id));
-  }
-
-  async getLearnedMappingsStats(routeId: number): Promise<{
-    totalMappings: number;
-    totalConfirmations: number;
-    mostConfirmedTranscript: string | null;
-    mostConfirmedCount: number;
-  }> {
-    const mappings = await this.getAllLearnedMappingsForRoute(routeId);
-
-    const totalConfirmations = mappings.reduce((sum, m) => sum + m.confirmationCount, 0);
-    const mostConfirmed = mappings[0];
-
-    return {
-      totalMappings: mappings.length,
-      totalConfirmations,
-      mostConfirmedTranscript: mostConfirmed?.normalizedTranscript || null,
-      mostConfirmedCount: mostConfirmed?.confirmationCount || 0,
-    };
-  }
-
-  clear(): void {
-    this.store.clear();
-  }
+      return req;
+    },
+  };
 }
 
+(globalThis as any).IDBKeyRange = {
+  only: (value: any) => ({ only: value }),
+};
+
 describe("routeIntelligencePersistentLearning", () => {
-  let learningStore: InMemoryLearningStore;
-
-  beforeEach(() => {
-    learningStore = new InMemoryLearningStore();
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    (globalThis as any).indexedDB = createFakeIndexedDB();
+    // Force a fresh IndexedDB connection (and thus a fresh in-memory store) per test.
+    vi.resetModules();
   });
 
-  afterEach(() => {
-    learningStore.clear();
-  });
+  describe("recordCorrection (server-first)", () => {
+    it("saves via the server and returns its response", async () => {
+      const { recordCorrection } = await import("./routeIntelligencePersistentLearning");
+      const serverMapping = {
+        id: 42,
+        routeId: 1,
+        stopId: 10,
+        originalTranscript: "Michael",
+        normalizedTranscript: "michael",
+        firstConfirmedAt: 1000,
+        lastConfirmedAt: 1000,
+        confirmationCount: 1,
+        tags: ["pronunciation"],
+      };
+      corrections.record.mutate.mockResolvedValue(serverMapping);
 
-  describe("recordCorrection", () => {
-    it("should create a new learned mapping on first correction", async () => {
-      const mapping = await learningStore.recordCorrection(
-        1,
-        10,
-        "Michael",
-        "michael",
-        ["pronunciation"]
+      const result = await recordCorrection(1, 10, "Michael", "michael", ["pronunciation"]);
+
+      expect(corrections.record.mutate).toHaveBeenCalledWith({
+        routeId: 1,
+        stopId: 10,
+        originalTranscript: "Michael",
+        normalizedTranscript: "michael",
+        tags: ["pronunciation"],
+      });
+      expect(result).toEqual(serverMapping);
+    });
+
+    it("falls back to the local cache when the server request fails", async () => {
+      const { recordCorrection, lookupLearnedMapping } = await import(
+        "./routeIntelligencePersistentLearning"
       );
+      corrections.record.mutate.mockRejectedValue(new Error("network down"));
+      corrections.lookup.query.mockRejectedValue(new Error("network down"));
+
+      const mapping = await recordCorrection(1, 10, "Michael", "michael");
 
       expect(mapping.routeId).toBe(1);
       expect(mapping.stopId).toBe(10);
-      expect(mapping.originalTranscript).toBe("Michael");
-      expect(mapping.normalizedTranscript).toBe("michael");
       expect(mapping.confirmationCount).toBe(1);
-      expect(mapping.tags).toContain("pronunciation");
-      expect(mapping.firstConfirmedAt).toBeGreaterThan(0);
-      expect(mapping.lastConfirmedAt).toBeGreaterThan(0);
-    });
 
-    it("should increment confirmation count on repeated correction", async () => {
-      const mapping1 = await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      const mapping2 = await learningStore.recordCorrection(1, 10, "Michael", "michael");
-
-      expect(mapping2.confirmationCount).toBe(2);
-      expect(mapping2.firstConfirmedAt).toBe(mapping1.firstConfirmedAt);
-      expect(mapping2.lastConfirmedAt).toBeGreaterThanOrEqual(mapping1.lastConfirmedAt);
-    });
-
-    it("should handle multiple corrections for same route", async () => {
-      const mapping1 = await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      const mapping2 = await learningStore.recordCorrection(1, 20, "Patrick", "patrick");
-
-      expect(mapping1.stopId).toBe(10);
-      expect(mapping2.stopId).toBe(20);
-      expect(mapping1.normalizedTranscript).not.toBe(mapping2.normalizedTranscript);
-    });
-
-    it("should handle different routes separately", async () => {
-      const mapping1 = await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      const mapping2 = await learningStore.recordCorrection(2, 10, "Michael", "michael");
-
-      expect(mapping1.routeId).toBe(1);
-      expect(mapping2.routeId).toBe(2);
-      expect(mapping1.confirmationCount).toBe(1);
-      expect(mapping2.confirmationCount).toBe(1);
-    });
-  });
-
-  describe("lookupLearnedMapping", () => {
-    it("should return null when no mapping exists", async () => {
-      const result = await learningStore.lookupLearnedMapping(1, "nonexistent");
-      expect(result).toBeNull();
-    });
-
-    it("should find a learned mapping by normalized transcript", async () => {
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      const result = await learningStore.lookupLearnedMapping(1, "michael");
-
-      expect(result).not.toBeNull();
+      // The local fallback should now be able to find it too.
+      const result = await lookupLearnedMapping(1, "michael");
       expect(result?.stopId).toBe(10);
       expect(result?.confirmationCount).toBe(1);
     });
 
-    it("should calculate confidence based on confirmation count", async () => {
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      const result1 = await learningStore.lookupLearnedMapping(1, "michael");
+    it("increments confirmation count on a repeated offline correction", async () => {
+      const { recordCorrection } = await import("./routeIntelligencePersistentLearning");
+      corrections.record.mutate.mockRejectedValue(new Error("network down"));
 
-      expect(result1?.confidence).toBe(0.6);
+      const first = await recordCorrection(1, 10, "Michael", "michael");
+      const second = await recordCorrection(1, 10, "Michael", "michael");
 
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      const result2 = await learningStore.lookupLearnedMapping(1, "michael");
+      expect(second.confirmationCount).toBe(2);
+      expect(second.firstConfirmedAt).toBe(first.firstConfirmedAt);
+    });
+  });
 
-      expect(result2?.confidence).toBe(0.7);
+  describe("lookupLearnedMapping (server-first)", () => {
+    it("returns the server result", async () => {
+      const { lookupLearnedMapping } = await import("./routeIntelligencePersistentLearning");
+      corrections.lookup.query.mockResolvedValue({
+        stopId: 10,
+        confidence: 0.6,
+        confirmationCount: 1,
+        lastConfirmedAt: 1000,
+      });
 
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      const result3 = await learningStore.lookupLearnedMapping(1, "michael");
+      const result = await lookupLearnedMapping(1, "michael");
 
-      expect(result3?.confidence).toBe(0.8);
+      expect(corrections.lookup.query).toHaveBeenCalledWith({
+        routeId: 1,
+        normalizedTranscript: "michael",
+      });
+      expect(result?.stopId).toBe(10);
     });
 
-    it("should return highest confidence mapping when multiple exist", async () => {
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      await learningStore.recordCorrection(1, 20, "Michael", "michael");
+    it("treats a null server response (no mapping found) as authoritative", async () => {
+      const { lookupLearnedMapping } = await import("./routeIntelligencePersistentLearning");
+      corrections.lookup.query.mockResolvedValue(null);
 
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
+      const result = await lookupLearnedMapping(1, "nonexistent");
 
-      const result = await learningStore.lookupLearnedMapping(1, "michael");
+      expect(result).toBeNull();
+    });
+
+    it("falls back to the local cache when the server request fails", async () => {
+      const { recordCorrection, lookupLearnedMapping } = await import(
+        "./routeIntelligencePersistentLearning"
+      );
+      corrections.record.mutate.mockRejectedValue(new Error("network down"));
+      await recordCorrection(1, 10, "Michael", "michael");
+
+      corrections.lookup.query.mockRejectedValue(new Error("network down"));
+      const result = await lookupLearnedMapping(1, "michael");
 
       expect(result?.stopId).toBe(10);
-      expect(result?.confirmationCount).toBe(3);
-    });
-
-    it("should return null for different route", async () => {
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      const result = await learningStore.lookupLearnedMapping(2, "michael");
-
-      expect(result).toBeNull();
     });
   });
 
-  describe("getAllLearnedMappingsForRoute", () => {
-    it("should return empty array when no mappings exist", async () => {
-      const mappings = await learningStore.getAllLearnedMappingsForRoute(1);
-      expect(mappings).toEqual([]);
+  describe("getAllLearnedMappingsForRoute (server-first)", () => {
+    it("returns the server list", async () => {
+      const { getAllLearnedMappingsForRoute } = await import(
+        "./routeIntelligencePersistentLearning"
+      );
+      const serverMappings = [
+        { id: 1, routeId: 1, stopId: 10, originalTranscript: "Michael", normalizedTranscript: "michael", firstConfirmedAt: 1, lastConfirmedAt: 1, confirmationCount: 2, tags: [] },
+      ];
+      corrections.listForRoute.query.mockResolvedValue(serverMappings);
+
+      const result = await getAllLearnedMappingsForRoute(1);
+
+      expect(corrections.listForRoute.query).toHaveBeenCalledWith({ routeId: 1 });
+      expect(result).toEqual(serverMappings);
     });
 
-    it("should return all mappings for a route", async () => {
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      await learningStore.recordCorrection(1, 20, "Patrick", "patrick");
-      await learningStore.recordCorrection(1, 30, "Sean", "sean");
+    it("falls back to the local cache when the server request fails", async () => {
+      const { recordCorrection, getAllLearnedMappingsForRoute } = await import(
+        "./routeIntelligencePersistentLearning"
+      );
+      corrections.record.mutate.mockRejectedValue(new Error("network down"));
+      await recordCorrection(1, 10, "Michael", "michael");
+      await recordCorrection(1, 20, "Patrick", "patrick");
 
-      const mappings = await learningStore.getAllLearnedMappingsForRoute(1);
+      corrections.listForRoute.query.mockRejectedValue(new Error("network down"));
+      const result = await getAllLearnedMappingsForRoute(1);
 
-      expect(mappings.length).toBe(3);
-      expect(mappings.map((m) => m.stopId)).toContain(10);
-      expect(mappings.map((m) => m.stopId)).toContain(20);
-      expect(mappings.map((m) => m.stopId)).toContain(30);
-    });
-
-    it("should sort by confirmation count (descending)", async () => {
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      await learningStore.recordCorrection(1, 20, "Patrick", "patrick");
-      await learningStore.recordCorrection(1, 30, "Sean", "sean");
-
-      await learningStore.recordCorrection(1, 20, "Patrick", "patrick");
-      await learningStore.recordCorrection(1, 20, "Patrick", "patrick");
-
-      const mappings = await learningStore.getAllLearnedMappingsForRoute(1);
-
-      expect(mappings[0].stopId).toBe(20);
-      expect(mappings[0].confirmationCount).toBe(3);
-    });
-
-    it("should exclude mappings from other routes", async () => {
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      await learningStore.recordCorrection(2, 20, "Patrick", "patrick");
-
-      const mappings1 = await learningStore.getAllLearnedMappingsForRoute(1);
-      const mappings2 = await learningStore.getAllLearnedMappingsForRoute(2);
-
-      expect(mappings1.length).toBe(1);
-      expect(mappings1[0].stopId).toBe(10);
-      expect(mappings2.length).toBe(1);
-      expect(mappings2[0].stopId).toBe(20);
+      expect(result.length).toBe(2);
+      expect(result.map(m => m.stopId).sort()).toEqual([10, 20]);
     });
   });
 
-  describe("deleteLearnedMapping", () => {
-    it("should delete a specific learned mapping", async () => {
-      const mapping = await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      await learningStore.deleteLearnedMapping(mapping.id);
+  describe("deleteLearnedMapping / clearLearnedMappingsForRoute", () => {
+    it("deletes via the server", async () => {
+      const { deleteLearnedMapping } = await import("./routeIntelligencePersistentLearning");
+      corrections.delete.mutate.mockResolvedValue({ success: true });
 
-      const result = await learningStore.lookupLearnedMapping(1, "michael");
-      expect(result).toBeNull();
+      await deleteLearnedMapping(42);
+
+      expect(corrections.delete.mutate).toHaveBeenCalledWith({ id: 42 });
     });
 
-    it("should not affect other mappings", async () => {
-      const mapping1 = await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      const mapping2 = await learningStore.recordCorrection(1, 20, "Patrick", "patrick");
+    it("propagates a server error instead of silently succeeding", async () => {
+      const { deleteLearnedMapping } = await import("./routeIntelligencePersistentLearning");
+      corrections.delete.mutate.mockRejectedValue(new Error("network down"));
 
-      await learningStore.deleteLearnedMapping(mapping1.id);
-
-      const result1 = await learningStore.lookupLearnedMapping(1, "michael");
-      const result2 = await learningStore.lookupLearnedMapping(1, "patrick");
-
-      expect(result1).toBeNull();
-      expect(result2).not.toBeNull();
-      expect(result2?.stopId).toBe(20);
+      await expect(deleteLearnedMapping(42)).rejects.toThrow("network down");
     });
-  });
 
-  describe("clearLearnedMappingsForRoute", () => {
-    it("should clear all mappings for a specific route", async () => {
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      await learningStore.recordCorrection(1, 20, "Patrick", "patrick");
-      await learningStore.recordCorrection(2, 30, "Sean", "sean");
+    it("clears via the server", async () => {
+      const { clearLearnedMappingsForRoute } = await import("./routeIntelligencePersistentLearning");
+      corrections.clearForRoute.mutate.mockResolvedValue({ success: true });
 
-      await learningStore.clearLearnedMappingsForRoute(1);
+      await clearLearnedMappingsForRoute(1);
 
-      const mappings1 = await learningStore.getAllLearnedMappingsForRoute(1);
-      const mappings2 = await learningStore.getAllLearnedMappingsForRoute(2);
-
-      expect(mappings1.length).toBe(0);
-      expect(mappings2.length).toBe(1);
+      expect(corrections.clearForRoute.mutate).toHaveBeenCalledWith({ routeId: 1 });
     });
   });
 
   describe("getLearnedMappingsStats", () => {
-    it("should return zero stats when no mappings exist", async () => {
-      const stats = await learningStore.getLearnedMappingsStats(1);
+    it("derives stats from the (server-backed) mapping list", async () => {
+      const { getLearnedMappingsStats } = await import("./routeIntelligencePersistentLearning");
+      corrections.listForRoute.query.mockResolvedValue([
+        { id: 1, routeId: 1, stopId: 10, originalTranscript: "Michael", normalizedTranscript: "michael", firstConfirmedAt: 1, lastConfirmedAt: 1, confirmationCount: 2, tags: [] },
+        { id: 2, routeId: 1, stopId: 20, originalTranscript: "Patrick", normalizedTranscript: "patrick", firstConfirmedAt: 1, lastConfirmedAt: 1, confirmationCount: 1, tags: [] },
+      ]);
 
-      expect(stats.totalMappings).toBe(0);
-      expect(stats.totalConfirmations).toBe(0);
-      expect(stats.mostConfirmedTranscript).toBeNull();
-      expect(stats.mostConfirmedCount).toBe(0);
-    });
-
-    it("should calculate correct statistics", async () => {
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      await learningStore.recordCorrection(1, 20, "Patrick", "patrick");
-
-      const stats = await learningStore.getLearnedMappingsStats(1);
+      const stats = await getLearnedMappingsStats(1);
 
       expect(stats.totalMappings).toBe(2);
       expect(stats.totalConfirmations).toBe(3);
@@ -410,67 +290,16 @@ describe("routeIntelligencePersistentLearning", () => {
       expect(stats.mostConfirmedCount).toBe(2);
     });
 
-    it("should track most confirmed mapping", async () => {
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      await learningStore.recordCorrection(1, 20, "Patrick", "patrick");
-      await learningStore.recordCorrection(1, 20, "Patrick", "patrick");
-      await learningStore.recordCorrection(1, 20, "Patrick", "patrick");
-      await learningStore.recordCorrection(1, 30, "Sean", "sean");
+    it("returns zero stats when no mappings exist", async () => {
+      const { getLearnedMappingsStats } = await import("./routeIntelligencePersistentLearning");
+      corrections.listForRoute.query.mockResolvedValue([]);
 
-      const stats = await learningStore.getLearnedMappingsStats(1);
+      const stats = await getLearnedMappingsStats(1);
 
-      expect(stats.totalMappings).toBe(3);
-      expect(stats.totalConfirmations).toBe(5);
-      expect(stats.mostConfirmedTranscript).toBe("patrick");
-      expect(stats.mostConfirmedCount).toBe(3);
-    });
-  });
-
-  describe("Confidence Calculation", () => {
-    it("should cap confidence at 0.85", async () => {
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-
-      for (let i = 0; i < 10; i++) {
-        await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      }
-
-      const result = await learningStore.lookupLearnedMapping(1, "michael");
-
-      expect(result?.confidence).toBeLessThanOrEqual(0.85);
-      expect(result?.confirmationCount).toBe(11);
-    });
-  });
-
-  describe("Integration: Learning Pipeline", () => {
-    it("should support full learning workflow", async () => {
-      // 1. User says "Michael" but no exact match
-      // 2. User manually selects stop 10
-      // 3. System records correction
-      const mapping = await learningStore.recordCorrection(1, 10, "Michael", "michael");
-
-      // 4. Next time user says "Michael", lookup should find it
-      const result = await learningStore.lookupLearnedMapping(1, "michael");
-
-      expect(result).not.toBeNull();
-      expect(result?.stopId).toBe(10);
-      expect(result?.confidence).toBe(0.6);
-
-      // 5. User confirms same mapping again
-      await learningStore.recordCorrection(1, 10, "Michael", "michael");
-      const result2 = await learningStore.lookupLearnedMapping(1, "michael");
-
-      expect(result2?.confidence).toBe(0.7);
-      expect(result2?.confirmationCount).toBe(2);
-
-      // 6. Admin can inspect all learned mappings
-      const allMappings = await learningStore.getAllLearnedMappingsForRoute(1);
-      expect(allMappings.length).toBe(1);
-      expect(allMappings[0].confirmationCount).toBe(2);
-
-      // 7. Admin can get statistics
-      const stats = await learningStore.getLearnedMappingsStats(1);
-      expect(stats.totalMappings).toBe(1);
-      expect(stats.totalConfirmations).toBe(2);
+      expect(stats.totalMappings).toBe(0);
+      expect(stats.totalConfirmations).toBe(0);
+      expect(stats.mostConfirmedTranscript).toBeNull();
+      expect(stats.mostConfirmedCount).toBe(0);
     });
   });
 });
