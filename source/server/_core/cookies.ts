@@ -42,7 +42,11 @@ export function getSessionCookieOptions(
   return {
     httpOnly: true,
     path: "/",
-    sameSite: "none",
+    // This app is single-origin (frontend + API share a host), so there's no
+    // cross-site cookie use to justify SameSite=None — which browsers reject
+    // outright unless secure is also true, breaking sessions on local HTTP.
+    // Lax works for both local http://localhost and production https://.
+    sameSite: "lax",
     secure: isSecureRequest(req),
   };
 }
