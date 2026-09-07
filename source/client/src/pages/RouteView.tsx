@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { trpc } from "@/lib/trpc";
+import { useAuth } from "@/_core/hooks/useAuth";
 import SortableStopCard from "@/components/SortableStopCard";
 import EditStopModal from "@/components/EditStopModal";
 import { useVoiceSearch } from "@/hooks/useVoiceSearch";
@@ -126,6 +127,9 @@ function resolveFirstConfidentRiMatch(results: SearchResult[], pool: Stop[]): St
 }
 
 export default function RouteView() {
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
+
   const [match, params] = useRoute("/route/:id");
   const routeIdParam = params?.id ? parseInt(params.id) : undefined;
   const { data: route } = trpc.routes.get.useQuery(
@@ -157,6 +161,13 @@ export default function RouteView() {
   const [saveNameModalOpen, setSaveNameModalOpen] = useState(false);
   const [lastFailedVoiceTranscript, setLastFailedVoiceTranscript] = useState<string>("");
 
+  // Reorder/add/delete are admin-only — if a session expires while drag mode
+  // is on, drop back to the read-only view instead of leaving edit UI stuck open.
+  useEffect(() => {
+    if (!isAdmin && dragMode) {
+      setDragMode(false);
+    }
+  }, [isAdmin, dragMode]);
 
   useEffect(() => {
     if (sections.length > 0 && activeSectionId === null) {
@@ -320,6 +331,7 @@ export default function RouteView() {
   });
 
   const handleDragEnd = useCallback((event: DragEndEvent) => {
+    if (!isAdmin) return;
     const { active, over } = event;
     if (!over || active.id === over.id) return;
 
@@ -340,12 +352,12 @@ export default function RouteView() {
 
       return reordered;
     });
-  }, [currentSectionId, reorderMutation]);
+  }, [isAdmin, currentSectionId, reorderMutation]);
 
   const handleAddStop = useCallback((insertAfterOrder?: number) => {
-    if (!activeSection) return;
+    if (!isAdmin || !activeSection) return;
     addStopMutation.mutate({ sectionId: currentSectionId, routeId, insertAfterOrder });
-  }, [activeSection, currentSectionId, routeId, addStopMutation]);
+  }, [isAdmin, activeSection, currentSectionId, routeId, addStopMutation]);
 
   // ── Voice state machine ───────────────────────────────────────────────────
   // Reset speech state when section changes
@@ -735,8 +747,14 @@ export default function RouteView() {
   }, [riEngine, routeId, route?.name]);
 
   const handleCardTap = useCallback((stop: Stop) => {
-    setIsNewStop(false);
-    setEditingStop(stop);
+    // Opening the edit modal is admin-only. The voice-search correction
+    // recording below must keep working for every postman regardless of
+    // login, since tapping a search result is also how they confirm a
+    // fuzzy/failed match — so it stays outside this check.
+    if (isAdmin) {
+      setIsNewStop(false);
+      setEditingStop(stop);
+    }
 
     // Check if this tap should trigger a learning correction
     // Only if: voice search just happened AND found no exact match AND user is selecting from results
@@ -791,7 +809,7 @@ export default function RouteView() {
         setSearchStartTime(null);
       }
     }
-  }, [lastVoiceContext, riEngine, fieldTestMode, searchStartTime, routeId, appMode, currentSectionId]);
+  }, [isAdmin, lastVoiceContext, riEngine, fieldTestMode, searchStartTime, routeId, appMode, currentSectionId]);
 
   const handleModalSaved = useCallback((updated: Stop) => {
     setLocalStops(prev => {
@@ -814,6 +832,7 @@ export default function RouteView() {
   }, [isNewStop, editingStop, deleteStopMutation]);
 
   const handleDeleteStop = useCallback(async (stopId: number) => {
+    if (!isAdmin) return;
     try {
       await deleteStopMutation.mutateAsync({ id: stopId });
       // Remove the stop and renumber remaining stops in the same section
@@ -834,7 +853,7 @@ export default function RouteView() {
       console.error("Failed to delete stop:", error);
       throw error;
     }
-  }, [deleteStopMutation]);
+  }, [isAdmin, deleteStopMutation]);
 
   const displayStops = dragMode ? stops : filteredStops;
 
@@ -853,17 +872,19 @@ export default function RouteView() {
             </p>
           </div>
           <div className="flex items-center gap-1">
-            <button
-              onClick={() => { setDragMode(v => !v); setSearchQuery(""); }}
-              title={dragMode ? "Exit reorder mode" : "Reorder stops"}
-              className={`p-2 rounded-full transition-colors ${
-                dragMode
-                  ? "bg-accent text-accent-foreground"
-                  : "hover:bg-white/10"
-              }`}
-            >
-              <ArrowUpDown size={17} />
-            </button>
+            {isAdmin && (
+              <button
+                onClick={() => { setDragMode(v => !v); setSearchQuery(""); }}
+                title={dragMode ? "Exit reorder mode" : "Reorder stops"}
+                className={`p-2 rounded-full transition-colors ${
+                  dragMode
+                    ? "bg-accent text-accent-foreground"
+                    : "hover:bg-white/10"
+                }`}
+              >
+                <ArrowUpDown size={17} />
+              </button>
+            )}
             <Link href="/map">
               <button className="p-2 rounded-full hover:bg-white/10 transition-colors" title="Map view">
                 <Map size={17} />
@@ -1041,7 +1062,7 @@ export default function RouteView() {
               </button>
             )}
           </div>
-        ) : dragMode ? (
+        ) : dragMode && isAdmin ? (
           <DndContext
             sensors={sensors}
             collisionDetection={closestCenter}
@@ -1065,6 +1086,7 @@ export default function RouteView() {
                     searchQuery=""
                     onTap={handleCardTap}
                     isDragMode={true}
+                    isAdmin={isAdmin}
                     onDelete={handleDeleteStop}
                   />
                   {/* Insert after this stop */}
@@ -1096,7 +1118,8 @@ export default function RouteView() {
                   searchQuery={searchQuery}
                   onTap={handleCardTap}
                   isDragMode={false}
-                  onDelete={dragMode ? handleDeleteStop : undefined}
+                  isAdmin={isAdmin}
+                  onDelete={dragMode && isAdmin ? handleDeleteStop : undefined}
                 />
               </div>
             );

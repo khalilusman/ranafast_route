@@ -5,6 +5,7 @@ interface StopCardProps {
   stop: Stop;
   searchQuery?: string;
   onTap?: (stop: Stop) => void;
+  isAdmin?: boolean;
 }
 
 function SideBadge({ side }: { side: string | null | undefined }) {
@@ -71,7 +72,7 @@ function filterAliases(aliases: string[], residents: string[]): string[] {
   });
 }
 
-export default function StopCard({ stop, searchQuery = "", onTap }: StopCardProps) {
+export default function StopCard({ stop, searchQuery = "", onTap, isAdmin = false }: StopCardProps) {
   const residents  = splitPipe(stop.residents);
   const rawAliases = splitPipe(stop.aliases);
   // Strip surname-only aliases (e.g. "Doran" when residents include "Sean Doran")
@@ -91,14 +92,23 @@ export default function StopCard({ stop, searchQuery = "", onTap }: StopCardProp
 
   return (
     <div
-      role="button"
-      tabIndex={0}
+      // Editing (button semantics, hover/cursor affordance, the tap-to-edit
+      // hint below) is admin-only. The onClick itself stays wired for every
+      // visitor regardless: tapping a search result after a voice/text search
+      // miss is also how postmen confirm a correction, and that must keep
+      // working with no login — see routeIntelligencePersistentLearning.ts.
+      role={isAdmin ? "button" : undefined}
+      tabIndex={isAdmin ? 0 : undefined}
       onClick={() => onTap?.(stop)}
-      onKeyDown={e => { if (e.key === "Enter" || e.key === " ") onTap?.(stop); }}
-      className={`bg-white rounded-xl border shadow-sm px-3 py-3 transition-all active:scale-[0.98] cursor-pointer select-none ${
+      onKeyDown={isAdmin ? (e => { if (e.key === "Enter" || e.key === " ") onTap?.(stop); }) : undefined}
+      className={`bg-white rounded-xl border shadow-sm px-3 py-3 transition-all select-none ${
+        isAdmin ? "active:scale-[0.98] cursor-pointer" : ""
+      } ${
         isSearchActive
           ? "ring-2 ring-primary/30 border-primary/30"
-          : "border-border hover:border-primary/30 hover:shadow-md"
+          : isAdmin
+          ? "border-border hover:border-primary/30 hover:shadow-md"
+          : "border-border"
       }`}
     >
       {/* ── Row 1: stop number · side · type · dog · drop-off · eircode ── */}
@@ -190,8 +200,8 @@ export default function StopCard({ stop, searchQuery = "", onTap }: StopCardProp
         </p>
       )}
 
-      {/* ── Tap hint ── */}
-      {onTap && (
+      {/* ── Tap hint (admin only) ── */}
+      {isAdmin && onTap && (
         <div className="mt-2 flex justify-end">
           <span className="text-[10px] text-muted-foreground/50">tap to edit</span>
         </div>

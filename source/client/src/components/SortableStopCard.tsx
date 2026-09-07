@@ -18,6 +18,7 @@ interface SortableStopCardProps {
   searchQuery?: string;
   onTap: (stop: Stop) => void;
   isDragMode: boolean;
+  isAdmin?: boolean;
   onDelete?: (stopId: number) => Promise<void>;
 }
 
@@ -26,6 +27,7 @@ export default function SortableStopCard({
   searchQuery,
   onTap,
   isDragMode,
+  isAdmin = false,
   onDelete,
 }: SortableStopCardProps) {
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
@@ -65,8 +67,8 @@ export default function SortableStopCard({
   return (
     <>
       <div ref={setNodeRef} style={style} className="flex items-stretch gap-2">
-        {/* Drag handle — only visible in drag mode */}
-        {isDragMode && (
+        {/* Drag handle — only visible in drag mode, admin-only feature */}
+        {isDragMode && isAdmin && (
           <button
             ref={setActivatorNodeRef}
             {...attributes}
@@ -84,11 +86,12 @@ export default function SortableStopCard({
             stop={stop}
             searchQuery={searchQuery}
             onTap={isDragMode ? undefined : onTap}
+            isAdmin={isAdmin}
           />
         </div>
 
-        {/* Delete button — only visible in drag mode */}
-        {isDragMode && onDelete && (
+        {/* Delete button — only visible in drag mode, admin-only feature */}
+        {isDragMode && isAdmin && onDelete && (
           <button
             onClick={() => setShowDeleteDialog(true)}
             disabled={isDeleting}
