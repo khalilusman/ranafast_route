@@ -128,15 +128,55 @@ describe("corrections.record", () => {
 });
 
 describe("corrections.delete", () => {
-  it("is public (no auth required) but throws when DB is unavailable", async () => {
+  it("throws UNAUTHORIZED when not authenticated", async () => {
     const caller = appRouter.createCaller(makeCtx());
+    await expect(caller.corrections.delete({ id: 1 })).rejects.toMatchObject({
+      code: "UNAUTHORIZED",
+    });
+  });
+
+  it("throws DB error when DB unavailable but user is authenticated", async () => {
+    const ctx = makeCtx({
+      user: {
+        id: 1,
+        openId: "owner",
+        email: "owner@example.com",
+        name: "Owner",
+        loginMethod: "manus",
+        role: "admin",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        lastSignedIn: new Date(),
+      },
+    });
+    const caller = appRouter.createCaller(ctx);
     await expect(caller.corrections.delete({ id: 1 })).rejects.toThrow("DB unavailable");
   });
 });
 
 describe("corrections.clearForRoute", () => {
-  it("is public (no auth required) but throws when DB is unavailable", async () => {
+  it("throws UNAUTHORIZED when not authenticated", async () => {
     const caller = appRouter.createCaller(makeCtx());
+    await expect(caller.corrections.clearForRoute({ routeId: 1 })).rejects.toMatchObject({
+      code: "UNAUTHORIZED",
+    });
+  });
+
+  it("throws DB error when DB unavailable but user is authenticated", async () => {
+    const ctx = makeCtx({
+      user: {
+        id: 1,
+        openId: "owner",
+        email: "owner@example.com",
+        name: "Owner",
+        loginMethod: "manus",
+        role: "admin",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        lastSignedIn: new Date(),
+      },
+    });
+    const caller = appRouter.createCaller(ctx);
     await expect(caller.corrections.clearForRoute({ routeId: 1 })).rejects.toThrow(
       "DB unavailable"
     );

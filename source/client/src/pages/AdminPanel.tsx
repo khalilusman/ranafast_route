@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { BarChart3, Settings, Zap, TrendingUp } from "lucide-react";
+import { BarChart3, Settings, Zap, TrendingUp, Loader2 } from "lucide-react";
 import { trpc } from "@/lib/trpc";
+import { useAuth } from "@/_core/hooks/useAuth";
 import FieldTestingDashboard from "@/components/FieldTestingDashboard";
 import LearnedMappingsManager from "@/components/LearnedMappingsManager";
 import RouteIntelligenceConfig from "@/components/RouteIntelligenceConfig";
@@ -9,9 +10,18 @@ import SystemAnalytics from "@/components/SystemAnalytics";
 type TabType = "field-testing" | "learned-mappings" | "ri-config" | "analytics";
 
 export default function AdminPanel() {
+  const { user, loading: authLoading } = useAuth({ redirectOnUnauthenticated: true });
   const [activeTab, setActiveTab] = useState<TabType>("field-testing");
   const [selectedRouteId, setSelectedRouteId] = useState<number | null>(null);
   const { data: routes = [] } = trpc.routes.list.useQuery();
+
+  if (authLoading || !user) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-background">
+        <Loader2 className="animate-spin text-primary" size={32} />
+      </div>
+    );
+  }
 
   const tabs: Array<{
     id: TabType;

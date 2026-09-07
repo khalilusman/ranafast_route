@@ -179,8 +179,10 @@ export const appRouter = router({
   }),
 
   // ── Corrections (shared learned-mapping cache) ───────────────────────────────
-  // Public: same trust model as sections/stops/routes below — postmen record
-  // and look up voice-search corrections without logging in.
+  // record/lookup/listForRoute are public — same trust model as sections/stops/
+  // routes below, so postmen can record and look up voice-search corrections
+  // without logging in. delete/clearForRoute are destructive admin actions and
+  // require an authenticated session.
   corrections: router({
     record: publicProcedure
       .input(z.object({
@@ -281,7 +283,7 @@ export const appRouter = router({
         });
       }),
 
-    delete: publicProcedure
+    delete: protectedProcedure
       .input(z.object({ id: z.number() }))
       .mutation(async ({ input }) => {
         const db = await getDb();
@@ -290,7 +292,7 @@ export const appRouter = router({
         return { success: true } as const;
       }),
 
-    clearForRoute: publicProcedure
+    clearForRoute: protectedProcedure
       .input(z.object({ routeId: z.number() }))
       .mutation(async ({ input }) => {
         const db = await getDb();
